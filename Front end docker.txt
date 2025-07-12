@@ -1,0 +1,234 @@
+# Dockerfile
+FROM python:3.11-slim
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Set work directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first for better caching
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Create data directory for SQLite database
+RUN mkdir -p /app/data
+
+# Create non-root user
+RUN adduser --disabled-password --gecos '' appuser && \
+    chown -R appuser:appuser /app
+USER appuser
+
+# Expose port
+EXPOSE 8765
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:8765/health || exit 1
+
+# Command to run the application
+CMD ["python", "app.py"]
+
+---
+
+# requirements.txt
+asyncio-websockets==0.9.0
+websockets==11.0.3
+numpy==1.24.3
+sqlite3-to-mysql==1.4.16
+aiofiles==23.2.1
+python-multipart==0.0.6
+uvloop==0.17.0
+psutil==5.9.5
+cryptography==41.0.3
+pydantic==2.1.1
+fastapi==0.101.0
+uvicorn==0.23.2
+
+---
+
+# docker-compose.yml
+version: '3.8'
+
+services:
+  aviator-predictor:
+    build: .
+    container_name: aviator-predictor
+    ports:
+      - "8765:8765"
+      - "8080:8080"  # For web dashboard
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=INFO
+      - DB_PATH=/app/data/aviator.db
+      - WS_HOST=0.0.0.0
+      - WS_PORT=8765
+      - WEB_HOST=0.0.0.0
+      - WEB_PORT=8080
+    restart: unless-stopped
+    networks:
+      - aviator-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 8765), timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  aviator-web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    container_name: aviator-web
+    ports:
+      - "3000:3000"
+    depends_on:
+      - aviator-predictor
+    environment:
+      - REACT_APP_WS_URL=ws://localhost:8765
+      - REACT_APP_API_URL=http://localhost:8080
+    networks:
+      - aviator-network
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: aviator-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - aviator-network
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+
+networks:
+  aviator-network:
+    driver: bridge
+
+---
+
+# Dockerfile.web
+FROM node:18-alpine
+
+WORKDIR /app
+
+# Copy package files
+COPY web/package*.json ./
+
+# Install dependencies
+RUN npm ci --only=production
+
+# Copy web application
+COPY web/ ./
+
+# Build the application
+RUN npm run build
+
+# Install serve to run the build
+RUN npm install -g serve
+
+# Expose port
+EXPOSE 3000
+
+# Start the application
+CMD ["serve", "-s", "build", "-l", "3000"]
+
+---
+
+# web/package.json
+{
+  "name": "aviator-web-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@testing-library/jest-dom": "^5.16.5",
+    "@testing-library/react": "^13.4.0",
+    "@testing-library/user-event": "^13.5.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-scripts": "5.0.1",
+    "recharts": "^2.7.2",
+    "socket.io-client": "^4.7.2",
+    "web-vitals": "^2.1.4"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject"
+  },
+  "eslintConfig": {
+    "extends": [
+      "react-app",
+      "react-app/jest"
+    ]
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "proxy": "http://localhost:8765"
+}
+
+---
+
+# web/src/App.js
+import React, { useState, useEffect } from 'react';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar } from 'recharts';
+import './App.css';
+
+function App() {
+  const [connected, setConnected] = useState(false);
+  const [predictions, setPredictions] = useState([]);
+  const [gameRounds, setGameRounds] = useState([]);
+  const [currentPrediction, setCurrentPrediction] = useState(null);
+  const [statistics, setStatistics] = useState({});
+  const [metrics, setMetrics] = useState({});
+  const [ws, setWs] = useState(null);
+
+  useEffect(() => {
+    const websocket = new WebSocket('ws://localhost:8765');
+    
+    websocket.onopen = () => {
+      setConnected(true);
+      console.log('Connected to Aviator Predictor');
+      
+      // Request initial data
+      websocket.send(JSON.stringify({ type: 'get_statistics' }));
+      websocket.send(JSON.stringify({ type: 'get_metrics' }));
+    };
+    
+    websocket.onmessage = (event) => {
+      const message = JSON.parse(event.data);
+      
+      switch (message.type) {
+        case 'prediction':
+          setCurrentPrediction(message.data);
+          setP
